@@ -1,8 +1,2 @@
-streamlit
-asyncpg
-python-dotenv
-ocr-nanonets-wrapper
-groq
-fuzzywuzzy
-python-Levenshtein
-asyncio
+streamlit 
+requests
