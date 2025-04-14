@@ -6,5 +6,4 @@ nanonets
 groq
 fuzzywuzzy
 python-Levenshtein
-sqlite3
 pandas
