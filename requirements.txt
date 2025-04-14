@@ -1,0 +1,10 @@
+streamlit
+pandas
+nanonets
+groq
+langchain
+langchain-groq
+fuzzywuzzy
+python-dotenv
+names
+python-Levenshtein
