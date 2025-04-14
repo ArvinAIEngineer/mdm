@@ -1,7 +1,5 @@
 import os
 import streamlit as st
-import asyncio
-import asyncpg
 import sqlite3
 from dotenv import load_dotenv
 from nanonets import NANONETSOCR
@@ -32,12 +30,12 @@ def init_database():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Create customers table if it doesn't exist
+    # Create customers table with name, phone, dob, address
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS customers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         phone TEXT,
+        dob TEXT,
         address TEXT,
         verification_status TEXT DEFAULT 'pending'
     )
@@ -52,37 +50,34 @@ def get_all_customers() -> List[Dict]:
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Explicitly include the id column in the query
-    cursor.execute('SELECT id, name, phone, address, verification_status FROM customers')
+    # Query the available columns: name, phone, dob, address, verification_status
+    cursor.execute('SELECT name, phone, dob, address, verification_status FROM customers')
     customers = [dict(row) for row in cursor.fetchall()]
     
     conn.close()
     return customers
 
-def add_customer(name: str, phone: str, address: str) -> int:
+def add_customer(name: str, phone: str, dob: str, address: str):
     """Add a new customer to the database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute(
-        'INSERT INTO customers (name, phone, address) VALUES (?, ?, ?)',
-        (name, phone, address)
+        'INSERT INTO customers (name, phone, dob, address) VALUES (?, ?, ?, ?)',
+        (name, phone, dob, address)
     )
     
-    customer_id = cursor.lastrowid
     conn.commit()
     conn.close()
-    
-    return customer_id
 
-def update_verification_status(customer_id: int, status: str):
-    """Update verification status for a customer"""
+def update_verification_status(name: str, status: str):
+    """Update verification status for a customer using name as identifier"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute(
-        'UPDATE customers SET verification_status = ? WHERE id = ?',
-        (status, customer_id)
+        'UPDATE customers SET verification_status = ? WHERE name = ?',
+        (status, name)
     )
     
     conn.commit()
@@ -101,6 +96,7 @@ def get_extraction_prompt(doc_type: str, text: str) -> str:
     Extract the following information from the text below and return it as a JSON object:
     - name: The full name of the person
     - phone: The phone number (if present)
+    - dob: The date of birth (if present)
     - address: The complete address
 
     Text: {text}
@@ -109,17 +105,19 @@ def get_extraction_prompt(doc_type: str, text: str) -> str:
     The name might be preceded by terms like "Name:", "Customer Name:", etc.
     The address might be preceded by "Address:", "Residence:", "Location:", etc.
     Phone numbers might be in various formats including +91 prefix or 10 digits.
+    Date of birth might be in formats like DD/MM/YYYY, MM-DD-YYYY, or written out.
 
     Return only the JSON object in this format:
     {{
         "name": "extracted name or null",
         "phone": "extracted phone or null",
+        "dob": "extracted dob or null",
         "address": "extracted address or null"
     }}
     """
     
     if doc_type == "id":
-        base_prompt += "\nNote: This is an ID document. Look for officially stated name and address."
+        base_prompt += "\nNote: This is an ID document. Look for officially stated name, dob, and address."
     elif doc_type == "bank":
         base_prompt += "\nNote: This is a bank statement. Look for account holder details and registered address."
     
@@ -147,11 +145,12 @@ def extract_entities_using_groq(text: str, doc_type: str) -> Dict[str, Optional[
         return {
             'name': extracted_info.get('name'),
             'phone': extracted_info.get('phone'),
+            'dob': extracted_info.get('dob'),
             'address': extracted_info.get('address')
         }
     except Exception as e:
         print(f"Error processing {doc_type} document:", str(e))
-        return {'name': None, 'phone': None, 'address': None}
+        return {'name': None, 'phone': None, 'dob': None, 'address': None}
 
 def process_document(file_path: str, doc_type: str) -> Dict[str, Optional[str]]:
     """Process document using OCR and Groq for entity extraction"""
@@ -163,12 +162,12 @@ def process_document(file_path: str, doc_type: str) -> Dict[str, Optional[str]]:
         return extract_entities_using_groq(text, doc_type)
     except Exception as e:
         print(f"Error in document processing: {str(e)}")
-        return {'name': None, 'phone': None, 'address': None}
+        return {'name': None, 'phone': None, 'dob': None, 'address': None}
 
-def compare_with_fuzzy_match(str1: str, str2: str, threshold: int = 80) -> bool:
+def compare_with_fuzzy_match(str1: str, str2: str, threshold: int = 80) -> Tuple[bool, int]:
     """Compare two strings using fuzzy matching"""
     if not str1 or not str2:
-        return False
+        return False, 0
     
     # Clean the strings
     str1 = str1.lower().strip()
@@ -202,6 +201,20 @@ def compare_phone_numbers(phone1: str, phone2: str) -> Tuple[bool, int]:
     
     exact_match = phone1 == phone2
     similarity = 100 if exact_match else 0
+    
+    return exact_match, similarity
+
+def compare_dob(dob1: str, dob2: str) -> Tuple[bool, int]:
+    """Compare dates of birth"""
+    if not dob1 or not dob2:
+        return False, 0
+    
+    # Remove any extra spaces and normalize separators
+    dob1 = dob1.strip().replace('/', '-').replace('.', '-')
+    dob2 = dob2.strip().replace('/', '-').replace('.', '-')
+    
+    exact_match = dob1 == dob2
+    similarity = 100 if exact_match else fuzz.ratio(dob1, dob2)
     
     return exact_match, similarity
 
@@ -241,6 +254,19 @@ def find_matching_customers(extracted_info: Dict, customers: List[Dict]) -> List
             else:
                 mismatches.append('phone')
                 match_details['phone'] = "Phone numbers differ"
+        
+        # Compare dob
+        if extracted_info['dob'] and customer['dob']:
+            dob_match, dob_score = compare_dob(extracted_info['dob'], customer['dob'])
+            total_score += dob_score
+            fields_compared += 1
+            
+            if dob_match:
+                matches.append('dob')
+                match_details['dob'] = f"Date of birth matched with {dob_score}% confidence"
+            else:
+                mismatches.append('dob')
+                match_details['dob'] = f"Dates of birth differ ({dob_score}% similarity)"
         
         # Compare address with fuzzy matching
         if extracted_info['address'] and customer['address']:
@@ -297,6 +323,7 @@ def main():
                     st.subheader("Extracted Information")
                     st.write(f"Name: {extracted_info['name']}")
                     st.write(f"Phone: {extracted_info['phone']}")
+                    st.write(f"DOB: {extracted_info['dob']}")
                     st.write(f"Address: {extracted_info['address']}")
                     
                     # Get all customers from database
@@ -316,9 +343,9 @@ def main():
                             match_percentage = round(result['avg_score'])
                             
                             st.markdown(f"### Match #{i+1} - {match_percentage}% overall similarity")
-                            st.write(f"**Database ID:** {customer['id']}")
                             st.write(f"**Name:** {customer['name']}")
                             st.write(f"**Phone:** {customer['phone']}")
+                            st.write(f"**DOB:** {customer['dob']}")
                             st.write(f"**Address:** {customer['address']}")
                             st.write(f"**Current Status:** {customer['verification_status']}")
                             
@@ -329,20 +356,21 @@ def main():
                                 st.write(f"{icon} {field.title()}: {detail}")
                                 
                             # Option to verify this customer
-                            if st.button(f"Verify Customer #{customer['id']}"):
-                                update_verification_status(customer['id'], "verified")
-                                st.success(f"Customer #{customer['id']} has been verified!")
+                            if st.button(f"Verify Customer {customer['name']}", key=f"verify_{i}"):
+                                update_verification_status(customer['name'], "verified")
+                                st.success(f"Customer {customer['name']} has been verified!")
                     else:
                         st.warning("No matching records found in the database.")
                         
                         # Option to add this customer to the database
                         if st.button("Add as New Customer"):
-                            customer_id = add_customer(
+                            add_customer(
                                 extracted_info['name'],
                                 extracted_info['phone'],
+                                extracted_info['dob'],
                                 extracted_info['address']
                             )
-                            st.success(f"New customer added with ID #{customer_id}")
+                            st.success(f"New customer {extracted_info['name']} added!")
                 
                 finally:
                     # Cleanup
@@ -360,9 +388,9 @@ def main():
             st.subheader(f"All Customers ({len(customers)})")
             for customer in customers:
                 st.markdown(f"""
-                **ID:** {customer['id']}  
                 **Name:** {customer['name']}  
                 **Phone:** {customer['phone']}  
+                **DOB:** {customer['dob']}  
                 **Address:** {customer['address']}  
                 **Status:** {customer['verification_status']}
                 ---
