@@ -1,9 +1,8 @@
 streamlit
-asyncio
 asyncpg
 python-dotenv
-nanonets
+ocr-nanonets-wrapper
 groq
 fuzzywuzzy
 python-Levenshtein
-pandas
+asyncio
