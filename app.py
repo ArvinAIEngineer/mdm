@@ -36,8 +36,7 @@ def init_database():
         name TEXT NOT NULL,
         phone TEXT,
         dob TEXT,
-        address TEXT,
-        verification_status TEXT DEFAULT 'pending'
+        address TEXT
     )
     ''')
     
@@ -50,8 +49,8 @@ def get_all_customers() -> List[Dict]:
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Query the available columns: name, phone, dob, address, verification_status
-    cursor.execute('SELECT name, phone, dob, address, verification_status FROM customers')
+    # Query the available columns: name, phone, dob, address
+    cursor.execute('SELECT name, phone, dob, address FROM customers')
     customers = [dict(row) for row in cursor.fetchall()]
     
     conn.close()
@@ -65,19 +64,6 @@ def add_customer(name: str, phone: str, dob: str, address: str):
     cursor.execute(
         'INSERT INTO customers (name, phone, dob, address) VALUES (?, ?, ?, ?)',
         (name, phone, dob, address)
-    )
-    
-    conn.commit()
-    conn.close()
-
-def update_verification_status(name: str, status: str):
-    """Update verification status for a customer using name as identifier"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute(
-        'UPDATE customers SET verification_status = ? WHERE name = ?',
-        (status, name)
     )
     
     conn.commit()
@@ -347,18 +333,12 @@ def main():
                             st.write(f"**Phone:** {customer['phone']}")
                             st.write(f"**DOB:** {customer['dob']}")
                             st.write(f"**Address:** {customer['address']}")
-                            st.write(f"**Current Status:** {customer['verification_status']}")
                             
                             # Display match details
                             st.markdown("**Match Details:**")
                             for field, detail in result['match_details'].items():
                                 icon = "✅" if field in result['matches'] else "❌"
                                 st.write(f"{icon} {field.title()}: {detail}")
-                                
-                            # Option to verify this customer
-                            if st.button(f"Verify Customer {customer['name']}", key=f"verify_{i}"):
-                                update_verification_status(customer['name'], "verified")
-                                st.success(f"Customer {customer['name']} has been verified!")
                     else:
                         st.warning("No matching records found in the database.")
                         
@@ -391,8 +371,7 @@ def main():
                 **Name:** {customer['name']}  
                 **Phone:** {customer['phone']}  
                 **DOB:** {customer['dob']}  
-                **Address:** {customer['address']}  
-                **Status:** {customer['verification_status']}
+                **Address:** {customer['address']}
                 ---
                 """)
         else:
