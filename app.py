@@ -52,7 +52,8 @@ def get_all_customers() -> List[Dict]:
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    cursor.execute('SELECT * FROM customers')
+    # Explicitly include the id column in the query
+    cursor.execute('SELECT id, name, phone, address, verification_status FROM customers')
     customers = [dict(row) for row in cursor.fetchall()]
     
     conn.close()
