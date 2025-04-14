@@ -1,11 +1,10 @@
 import os
 import streamlit as st
-import sqlite3
 from dotenv import load_dotenv
-from nanonets import NANONETSOCR
 from groq import Groq
 import json
-from typing import Dict, Optional, List, Tuple
+import requests
+from typing import Dict, Optional
 from fuzzywuzzy import fuzz
 
 # Load environment variables
@@ -14,67 +13,96 @@ load_dotenv()
 # Configuration
 NANONETS_API_KEY = os.getenv("NANONETS_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-DB_PATH = "customers.db"  # SQLite database
+NANONETS_MODEL_ID = os.getenv("NANONETS_MODEL_ID", "")  # You'll need to set this in your .env file
 
-# Initialize OCR and LLM
-model = NANONETSOCR()
-model.set_token(NANONETS_API_KEY)
+# Initialize Groq client
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Ensure temp directory exists
 os.makedirs("temp", exist_ok=True)
-
-# Database functions for SQLite
-def init_database():
-    """Initialize the SQLite database with necessary tables if they don't exist"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Create customers table with name, phone, dob, address
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS customers (
-        name TEXT NOT NULL,
-        phone TEXT,
-        dob TEXT,
-        address TEXT
-    )
-    ''')
-    
-    conn.commit()
-    conn.close()
-
-def get_all_customers() -> List[Dict]:
-    """Get all customers from the database"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    # Query the available columns: name, phone, dob, address
-    cursor.execute('SELECT name, phone, dob, address FROM customers')
-    customers = [dict(row) for row in cursor.fetchall()]
-    
-    conn.close()
-    return customers
-
-def add_customer(name: str, phone: str, dob: str, address: str):
-    """Add a new customer to the database"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute(
-        'INSERT INTO customers (name, phone, dob, address) VALUES (?, ?, ?, ?)',
-        (name, phone, dob, address)
-    )
-    
-    conn.commit()
-    conn.close()
 
 def save_uploaded_file(uploaded_file) -> str:
     """Save uploaded file to temp directory and return the path"""
     file_path = os.path.join("temp", uploaded_file.name)
     with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
+    print(f"DEBUG: Saved file to {file_path}")
     return file_path
+
+def perform_ocr_with_nanonets(file_path: str) -> str:
+    """Perform OCR using Nanonets API directly"""
+    print(f"\nDEBUG: Starting OCR for document at {file_path}")
+    
+    try:
+        # API endpoint for prediction
+        url = f"https://app.nanonets.com/api/v2/OCR/Model/{NANONETS_MODEL_ID}/LabelFile/"
+        
+        # Open the file and send it to Nanonets
+        with open(file_path, 'rb') as f:
+            data = {'file': f}
+            response = requests.post(
+                url,
+                auth=requests.auth.HTTPBasicAuth(NANONETS_API_KEY, ''),
+                files=data
+            )
+        
+        # Check if the request was successful
+        if response.status_code != 200:
+            print(f"DEBUG: OCR API request failed with status code {response.status_code}")
+            print(f"DEBUG: Response content: {response.text}")
+            return ""
+        
+        # Parse the response
+        result = response.json()
+        print(f"DEBUG: OCR API response received. Status: {result.get('message')}")
+        
+        # Extract the text
+        extracted_text = ""
+        
+        # Navigate through the JSON response to get the text
+        # The structure may vary based on your model configuration
+        try:
+            # For general OCR models, text is usually in result -> prediction -> ocr_text
+            if 'result' in result and result['result']:
+                prediction = result['result'][0]['prediction']
+                
+                # Check if this is an OCR text model or a structured model
+                if 'ocr_text' in prediction:
+                    # Simple OCR text model
+                    extracted_text = prediction['ocr_text']
+                elif 'pages' in prediction:
+                    # Structured document model
+                    pages = prediction['pages']
+                    for page in pages:
+                        for line in page.get('lines', []):
+                            extracted_text += line.get('text', '') + "\n"
+                else:
+                    # Try to extract from any potential text fields
+                    for field in prediction:
+                        if isinstance(field, dict) and 'text' in field:
+                            extracted_text += field['text'] + "\n"
+            
+            print(f"DEBUG: Extracted text length: {len(extracted_text)}")
+            if len(extracted_text) < 100:
+                print(f"DEBUG: Warning: Very little text extracted. Full text: {extracted_text}")
+            else:
+                print(f"DEBUG: First 200 chars of extracted text: {extracted_text[:200]}")
+                
+            # If no text was extracted, try to get the raw OCR result
+            if not extracted_text and 'raw' in result:
+                print("DEBUG: Using raw OCR result")
+                extracted_text = json.dumps(result['raw'])
+                
+            return extracted_text
+                
+        except Exception as extract_error:
+            print(f"DEBUG: Error extracting text from OCR response: {str(extract_error)}")
+            print(f"DEBUG: Response structure: {json.dumps(result, indent=2)[:500]}...")
+            return ""
+            
+    except Exception as e:
+        print(f"DEBUG: Error in OCR process: {str(e)}")
+        return ""
 
 def get_extraction_prompt(doc_type: str, text: str) -> str:
     """Generate appropriate prompt based on document type"""
@@ -105,8 +133,9 @@ def get_extraction_prompt(doc_type: str, text: str) -> str:
     if doc_type == "id":
         base_prompt += "\nNote: This is an ID document. Look for officially stated name, dob, and address."
     elif doc_type == "bank":
-        base_prompt += "\nNote: This is a bank statement. Look for account holder details and registered address."
+        base_prompt += "\nNote: This is a bank statement. Look for account holder details, dob, and registered address."
     
+    print(f"DEBUG: Generated prompt for {doc_type} document")
     return base_prompt.format(text=text)
 
 def extract_entities_using_groq(text: str, doc_type: str) -> Dict[str, Optional[str]]:
@@ -114,6 +143,9 @@ def extract_entities_using_groq(text: str, doc_type: str) -> Dict[str, Optional[
     prompt = get_extraction_prompt(doc_type, text)
 
     try:
+        print(f"\nDEBUG: Sending text to Groq for {doc_type} document")
+        print(f"DEBUG: First 200 chars of text: {text[:200]}")
+        
         response = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="mixtral-8x7b-32768",
@@ -122,38 +154,51 @@ def extract_entities_using_groq(text: str, doc_type: str) -> Dict[str, Optional[
         )
         
         # Log the raw text and extracted information for debugging
-        print(f"\nProcessing {doc_type.upper()} document")
-        print("Raw OCR text:", text[:500] + "..." if len(text) > 500 else text)
-        print("Groq response:", response.choices[0].message.content)
+        print(f"\nDEBUG: Processing {doc_type.upper()} document")
+        print(f"DEBUG: Raw OCR text length: {len(text)} characters")
+        print(f"DEBUG: Raw OCR text sample: {text[:500]}...")
+        print(f"DEBUG: Groq response: {response.choices[0].message.content}")
         
         # Parse the response into a dictionary
-        extracted_info = json.loads(response.choices[0].message.content)
-        return {
-            'name': extracted_info.get('name'),
-            'phone': extracted_info.get('phone'),
-            'dob': extracted_info.get('dob'),
-            'address': extracted_info.get('address')
-        }
+        try:
+            extracted_info = json.loads(response.choices[0].message.content)
+            print(f"DEBUG: Parsed JSON from Groq: {extracted_info}")
+            return {
+                'name': extracted_info.get('name'),
+                'phone': extracted_info.get('phone'),
+                'dob': extracted_info.get('dob'),
+                'address': extracted_info.get('address')
+            }
+        except json.JSONDecodeError as je:
+            print(f"DEBUG: JSON parse error: {str(je)}")
+            print(f"DEBUG: Raw response that failed to parse: {response.choices[0].message.content}")
+            return {'name': None, 'phone': None, 'dob': None, 'address': None}
+            
     except Exception as e:
-        print(f"Error processing {doc_type} document:", str(e))
+        print(f"DEBUG: Error processing {doc_type} document: {str(e)}")
         return {'name': None, 'phone': None, 'dob': None, 'address': None}
 
 def process_document(file_path: str, doc_type: str) -> Dict[str, Optional[str]]:
     """Process document using OCR and Groq for entity extraction"""
     try:
-        # Get OCR text
-        text = model.convert_to_string(file_path, formatting='lines')
+        # Get OCR text using Nanonets API directly
+        text = perform_ocr_with_nanonets(file_path)
+        
+        if not text:
+            print(f"DEBUG: No text extracted from {doc_type} document")
+            return {'name': None, 'phone': None, 'dob': None, 'address': None}
         
         # Extract entities using Groq
         return extract_entities_using_groq(text, doc_type)
     except Exception as e:
-        print(f"Error in document processing: {str(e)}")
+        print(f"DEBUG: Error in document processing: {str(e)}")
         return {'name': None, 'phone': None, 'dob': None, 'address': None}
 
-def compare_with_fuzzy_match(str1: str, str2: str, threshold: int = 80) -> Tuple[bool, int]:
+def compare_with_fuzzy_match(str1: str, str2: str, threshold: int = 80) -> bool:
     """Compare two strings using fuzzy matching"""
     if not str1 or not str2:
-        return False, 0
+        print(f"DEBUG: Fuzzy match failed - one or both strings empty")
+        return False
     
     # Clean the strings
     str1 = str1.lower().strip()
@@ -165,217 +210,199 @@ def compare_with_fuzzy_match(str1: str, str2: str, threshold: int = 80) -> Tuple
     
     # Use the higher of the two scores
     similarity = max(ratio, token_sort_ratio)
+    print(f"DEBUG: Fuzzy match - '{str1}' vs '{str2}' - ratio: {ratio}, token sort ratio: {token_sort_ratio}, using: {similarity}")
     
-    return similarity >= threshold, similarity
+    return similarity >= threshold
 
-def compare_phone_numbers(phone1: str, phone2: str) -> Tuple[bool, int]:
+def compare_phone_numbers(phone1: str, phone2: str) -> bool:
     """Compare phone numbers by removing all non-digits"""
     if not phone1 or not phone2:
-        return False, 0
+        print(f"DEBUG: Phone comparison failed - one or both numbers empty")
+        return False
     
     # Remove all non-digits
-    phone1 = ''.join(filter(str.isdigit, phone1))
-    phone2 = ''.join(filter(str.isdigit, phone2))
+    phone1_clean = ''.join(filter(str.isdigit, phone1))
+    phone2_clean = ''.join(filter(str.isdigit, phone2))
     
     # If both are empty after cleaning, return False
-    if not phone1 or not phone2:
-        return False, 0
+    if not phone1_clean or not phone2_clean:
+        print(f"DEBUG: Phone comparison failed - one or both numbers have no digits")
+        return False
     
     # Compare the last 10 digits if longer
-    phone1 = phone1[-10:] if len(phone1) >= 10 else phone1
-    phone2 = phone2[-10:] if len(phone2) >= 10 else phone2
+    phone1_final = phone1_clean[-10:] if len(phone1_clean) >= 10 else phone1_clean
+    phone2_final = phone2_clean[-10:] if len(phone2_clean) >= 10 else phone2_clean
     
-    exact_match = phone1 == phone2
-    similarity = 100 if exact_match else 0
+    result = phone1_final == phone2_final
+    print(f"DEBUG: Phone comparison - '{phone1}' ({phone1_final}) vs '{phone2}' ({phone2_final}) - Match: {result}")
     
-    return exact_match, similarity
+    return result
 
-def compare_dob(dob1: str, dob2: str) -> Tuple[bool, int]:
+def compare_dob(dob1: str, dob2: str) -> bool:
     """Compare dates of birth"""
     if not dob1 or not dob2:
-        return False, 0
+        print(f"DEBUG: DOB comparison failed - one or both dates empty")
+        return False
     
     # Remove any extra spaces and normalize separators
-    dob1 = dob1.strip().replace('/', '-').replace('.', '-')
-    dob2 = dob2.strip().replace('/', '-').replace('.', '-')
+    dob1_clean = dob1.strip().replace('/', '-').replace('.', '-')
+    dob2_clean = dob2.strip().replace('/', '-').replace('.', '-')
     
-    exact_match = dob1 == dob2
-    similarity = 100 if exact_match else fuzz.ratio(dob1, dob2)
+    result = dob1_clean == dob2_clean
+    print(f"DEBUG: DOB comparison - '{dob1}' ({dob1_clean}) vs '{dob2}' ({dob2_clean}) - Match: {result}")
     
-    return exact_match, similarity
+    return result
 
-def find_matching_customers(extracted_info: Dict, customers: List[Dict]) -> List[Dict]:
-    """Find matching customers in the database using fuzzy matching"""
-    matching_results = []
+def compare_extracted_info(id_info: Dict, bank_info: Dict) -> tuple:
+    """Compare extracted information from both documents"""
+    matches = []
+    mismatches = []
+    match_details = {}
     
-    for customer in customers:
-        matches = []
-        mismatches = []
-        match_details = {}
-        total_score = 0
-        fields_compared = 0
-        
-        # Compare name with fuzzy matching
-        if extracted_info['name'] and customer['name']:
-            name_match, name_score = compare_with_fuzzy_match(extracted_info['name'], customer['name'])
-            total_score += name_score
-            fields_compared += 1
-            
-            if name_match:
-                matches.append('name')
-                match_details['name'] = f"Name matched with {name_score}% confidence"
-            else:
-                mismatches.append('name')
-                match_details['name'] = f"Names differ ({name_score}% similarity)"
-        
-        # Compare phone with exact matching
-        if extracted_info['phone'] and customer['phone']:
-            phone_match, phone_score = compare_phone_numbers(extracted_info['phone'], customer['phone'])
-            total_score += phone_score
-            fields_compared += 1
-            
-            if phone_match:
-                matches.append('phone')
-                match_details['phone'] = "Phone numbers match exactly"
-            else:
-                mismatches.append('phone')
-                match_details['phone'] = "Phone numbers differ"
-        
-        # Compare dob
-        if extracted_info['dob'] and customer['dob']:
-            dob_match, dob_score = compare_dob(extracted_info['dob'], customer['dob'])
-            total_score += dob_score
-            fields_compared += 1
-            
-            if dob_match:
-                matches.append('dob')
-                match_details['dob'] = f"Date of birth matched with {dob_score}% confidence"
-            else:
-                mismatches.append('dob')
-                match_details['dob'] = f"Dates of birth differ ({dob_score}% similarity)"
-        
-        # Compare address with fuzzy matching
-        if extracted_info['address'] and customer['address']:
-            address_match, address_score = compare_with_fuzzy_match(extracted_info['address'], customer['address'])
-            total_score += address_score
-            fields_compared += 1
-            
-            if address_match:
-                matches.append('address')
-                match_details['address'] = f"Addresses match with {address_score}% similarity"
-            else:
-                mismatches.append('address')
-                match_details['address'] = f"Addresses differ ({address_score}% similarity)"
-        
-        # Calculate average matching score
-        avg_score = total_score / fields_compared if fields_compared > 0 else 0
-        
-        # Add to matching results if at least one field matches
-        if matches:
-            matching_results.append({
-                'customer': customer,
-                'matches': matches,
-                'mismatches': mismatches,
-                'match_details': match_details,
-                'avg_score': avg_score,
-                'num_matches': len(matches)
-            })
+    print("\nDEBUG: Comparing extracted information")
+    print(f"DEBUG: ID info: {id_info}")
+    print(f"DEBUG: Bank info: {bank_info}")
     
-    # Sort by number of matches and then by average score
-    matching_results.sort(key=lambda x: (x['num_matches'], x['avg_score']), reverse=True)
+    # Compare name
+    if id_info['name'] and bank_info['name']:
+        name_match = compare_with_fuzzy_match(id_info['name'], bank_info['name'])
+        if name_match:
+            matches.append('name')
+            match_details['name'] = "Matched with high confidence"
+        else:
+            mismatches.append('name')
+            match_details['name'] = "Names differ significantly"
+    else:
+        print(f"DEBUG: Skipping name comparison - ID name: {id_info['name']}, Bank name: {bank_info['name']}")
     
-    return matching_results
+    # Compare phone
+    if id_info['phone'] and bank_info['phone']:
+        phone_match = compare_phone_numbers(id_info['phone'], bank_info['phone'])
+        if phone_match:
+            matches.append('phone')
+            match_details['phone'] = "Phone numbers match"
+        else:
+            mismatches.append('phone')
+            match_details['phone'] = "Phone numbers differ"
+    else:
+        print(f"DEBUG: Skipping phone comparison - ID phone: {id_info['phone']}, Bank phone: {bank_info['phone']}")
+    
+    # Compare dob
+    if id_info['dob'] and bank_info['dob']:
+        dob_match = compare_dob(id_info['dob'], bank_info['dob'])
+        if dob_match:
+            matches.append('dob')
+            match_details['dob'] = "Dates of birth match"
+        else:
+            mismatches.append('dob')
+            match_details['dob'] = "Dates of birth differ"
+    else:
+        print(f"DEBUG: Skipping DOB comparison - ID DOB: {id_info['dob']}, Bank DOB: {bank_info['dob']}")
+    
+    # Compare address
+    if id_info['address'] and bank_info['address']:
+        address_match = compare_with_fuzzy_match(id_info['address'], bank_info['address'])
+        if address_match:
+            matches.append('address')
+            match_details['address'] = "Addresses match with high similarity"
+        else:
+            mismatches.append('address')
+            match_details['address'] = "Addresses differ significantly"
+    else:
+        print(f"DEBUG: Skipping address comparison - ID address: {id_info['address']}, Bank address: {bank_info['address']}")
+    
+    # Consider verified if at least 2 fields match
+    is_verified = len(matches) >= 2
+    print(f"DEBUG: Verification result: {is_verified} with {len(matches)} matches and {len(mismatches)} mismatches")
+    
+    return is_verified, matches, mismatches, match_details
 
 def main():
-    # Initialize the database
-    init_database()
-    
     st.title("Customer Document Verification")
     
-    # Upload document for verification
-    uploaded_file = st.file_uploader("Upload Customer Document (PDF)", type="pdf")
+    # Display warning if model ID is not set
+    if not NANONETS_MODEL_ID:
+        st.warning("⚠️ Please set the NANONETS_MODEL_ID in your .env file")
     
-    if uploaded_file:
-        if st.button("Process Document"):
-            with st.spinner("Processing document..."):
+    st.write("Please upload your documents for verification:")
+    
+    id_file = st.file_uploader("Upload ID Document (PDF)", type="pdf", key="id_file")
+    bank_file = st.file_uploader("Upload Bank Statement (PDF)", type="pdf", key="bank_file")
+    
+    # Debug toggle
+    show_debug = st.checkbox("Show Debug Information", value=False)
+    
+    if id_file and bank_file:
+        if st.button("Verify Documents"):
+            with st.spinner("Processing documents..."):
                 try:
-                    # Save and process file
-                    file_path = save_uploaded_file(uploaded_file)
+                    print("\n=== STARTING NEW VERIFICATION PROCESS ===")
+                    # Save and process files
+                    id_path = save_uploaded_file(id_file)
+                    bank_path = save_uploaded_file(bank_file)
                     
-                    # Process document (we'll use ID type for generic extraction)
-                    extracted_info = process_document(file_path, "id")
+                    # Extract information
+                    id_info = process_document(id_path, "id")
+                    bank_info = process_document(bank_path, "bank")
                     
                     # Display extracted information
-                    st.subheader("Extracted Information")
-                    st.write(f"Name: {extracted_info['name']}")
-                    st.write(f"Phone: {extracted_info['phone']}")
-                    st.write(f"DOB: {extracted_info['dob']}")
-                    st.write(f"Address: {extracted_info['address']}")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.subheader("ID Document Info")
+                        st.write(f"Name: {id_info['name'] or 'Not found'}")
+                        st.write(f"Phone: {id_info['phone'] or 'Not found'}")
+                        st.write(f"DOB: {id_info['dob'] or 'Not found'}")
+                        st.write(f"Address: {id_info['address'] or 'Not found'}")
                     
-                    # Get all customers from database
-                    customers = get_all_customers()
+                    with col2:
+                        st.subheader("Bank Statement Info")
+                        st.write(f"Name: {bank_info['name'] or 'Not found'}")
+                        st.write(f"Phone: {bank_info['phone'] or 'Not found'}")
+                        st.write(f"DOB: {bank_info['dob'] or 'Not found'}")
+                        st.write(f"Address: {bank_info['address'] or 'Not found'}")
                     
-                    # Find matching customers
-                    matching_results = find_matching_customers(extracted_info, customers)
+                    # Compare and verify
+                    is_verified, matches, mismatches, match_details = compare_extracted_info(id_info, bank_info)
                     
-                    # Display matching results
-                    st.subheader("Database Matching Results")
-                    
-                    if matching_results:
-                        st.write(f"Found {len(matching_results)} potential matches:")
-                        
-                        for i, result in enumerate(matching_results):
-                            customer = result['customer']
-                            match_percentage = round(result['avg_score'])
-                            
-                            st.markdown(f"### Match #{i+1} - {match_percentage}% overall similarity")
-                            st.write(f"**Name:** {customer['name']}")
-                            st.write(f"**Phone:** {customer['phone']}")
-                            st.write(f"**DOB:** {customer['dob']}")
-                            st.write(f"**Address:** {customer['address']}")
-                            
-                            # Display match details
-                            st.markdown("**Match Details:**")
-                            for field, detail in result['match_details'].items():
-                                icon = "✅" if field in result['matches'] else "❌"
-                                st.write(f"{icon} {field.title()}: {detail}")
+                    # Display verification results
+                    st.subheader("Verification Results")
+                    if is_verified:
+                        st.success("Documents Verified Successfully!")
                     else:
-                        st.warning("No matching records found in the database.")
-                        
-                        # Option to add this customer to the database
-                        if st.button("Add as New Customer"):
-                            add_customer(
-                                extracted_info['name'],
-                                extracted_info['phone'],
-                                extracted_info['dob'],
-                                extracted_info['address']
-                            )
-                            st.success(f"New customer {extracted_info['name']} added!")
+                        st.error("Document Verification Failed")
+                    
+                    # Show detailed matching results
+                    st.subheader("Matching Details")
+                    
+                    for field in ['name', 'phone', 'dob', 'address']:
+                        if field in match_details:
+                            icon = "✅" if field in matches else "❌"
+                            st.write(f"{icon} {field.title()}: {match_details[field]}")
+                        else:
+                            st.write(f"❓ {field.title()}: Insufficient data for comparison")
+                    
+                    # Show debug information if enabled
+                    if show_debug:
+                        st.subheader("Debug Information")
+                        st.write("ID Document Raw Info:")
+                        st.json(id_info)
+                        st.write("Bank Statement Raw Info:")
+                        st.json(bank_info)
                 
                 finally:
                     # Cleanup
-                    if 'file_path' in locals():
+                    if 'id_path' in locals():
                         try:
-                            os.remove(file_path)
-                        except:
-                            pass
-    
-    # Option to view all customers in the database
-    if st.checkbox("View All Customers in Database"):
-        customers = get_all_customers()
-        
-        if customers:
-            st.subheader(f"All Customers ({len(customers)})")
-            for customer in customers:
-                st.markdown(f"""
-                **Name:** {customer['name']}  
-                **Phone:** {customer['phone']}  
-                **DOB:** {customer['dob']}  
-                **Address:** {customer['address']}
-                ---
-                """)
-        else:
-            st.info("No customers in the database yet.")
+                            os.remove(id_path)
+                            print(f"DEBUG: Removed temporary file {id_path}")
+                        except Exception as e:
+                            print(f"DEBUG: Failed to remove {id_path}: {str(e)}")
+                    if 'bank_path' in locals():
+                        try:
+                            os.remove(bank_path)
+                            print(f"DEBUG: Removed temporary file {bank_path}")
+                        except Exception as e:
+                            print(f"DEBUG: Failed to remove {bank_path}: {str(e)}")
 
 if __name__ == "__main__":
     main()
