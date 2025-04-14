@@ -1,10 +1,10 @@
 streamlit
-pandas
+asyncio
+asyncpg
+python-dotenv
 nanonets
 groq
-langchain
-langchain-groq
 fuzzywuzzy
-python-dotenv
-names
 python-Levenshtein
+sqlite3
+pandas
