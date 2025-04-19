@@ -21,6 +21,10 @@ if "chat_stage" not in st.session_state:
     st.session_state.chat_stage = "init"
 if "uploaded_file" not in st.session_state:
     st.session_state.uploaded_file = None
+if "extracted_data" not in st.session_state:
+    st.session_state.extracted_data = None
+if "add_result" not in st.session_state:
+    st.session_state.add_result = None
 
 # Database functions
 def get_all_customers(db_name="customers.db"):
@@ -80,7 +84,6 @@ def extract_text_from_image(uploaded_file):
     if response.status_code != 200:
         return ""
     result = response.json()
-    raw_text = ""
     def find_raw_text(obj):
         if isinstance(obj, dict):
             if "raw_text" in obj:
@@ -121,10 +124,29 @@ def extract_entities_with_groq(raw_text):
         return None
 
 # UI Title
-st.title("📇 Customer Info Chatbot")
+st.title("\U0001F4C7 Customer Info Chatbot")
+
+# Form submission
+if st.session_state.add_result == "success":
+    st.success("✅ Customer added to database.")
+    st.session_state.add_result = None
+    st.session_state.extracted_data = None
+elif st.session_state.add_result == "error":
+    st.error("❌ Failed to add customer.")
+    st.session_state.add_result = None
 
 # Chatbot flow
 if st.session_state.chat_stage == "init":
+    user_input = st.chat_input("Type 'hi' to begin")
+    if user_input:
+        if user_input.lower().strip() == "hi":
+            st.session_state.chat_stage = "waiting_for_choice"
+            st.experimental_rerun()
+        else:
+            with st.chat_message("bot"):
+                st.markdown("❓ Please type 'hi' to get started.")
+
+elif st.session_state.chat_stage == "waiting_for_choice":
     with st.chat_message("bot"):
         st.markdown("Hi! Do you want to upload a document or enter customer details manually?")
     user_input = st.chat_input("Type 'upload' or 'enter'")
@@ -149,55 +171,61 @@ elif st.session_state.chat_stage == "process_upload":
         st.image(uploaded_file, caption="Uploaded image", use_column_width=True)
         st.markdown("🔍 Extracting text from image...")
     raw_text = extract_text_from_image(uploaded_file)
+    safe_text = raw_text.encode('utf-8', 'replace').decode('utf-8')
     with st.chat_message("bot"):
         st.markdown("🧠 Running LLM to format extracted text...")
-        st.text(raw_text)
-    extracted_data = extract_entities_with_groq(raw_text)
-    with st.chat_message("bot"):
-        if extracted_data:
-            st.markdown("✅ Here's the extracted customer data:")
-            st.json(extracted_data)
-            customers = get_all_customers()
-            is_match, matched, scores = fuzzy_match_customer(extracted_data, customers)
-            if is_match:
-                st.info("✅ Customer already exists:")
-                st.json(matched)
-                st.write("**Match Scores:**")
-                st.json(scores)
-            else:
-                st.warning("🆕 This is a new customer.")
-                st.json(extracted_data)
-                if st.button("✅ Add to database"):
-                    insert_customer("customers.db", extracted_data)
-                    st.success("Customer added successfully!")
-        else:
-            st.error("❌ Could not extract structured data from image.")
-    st.session_state.chat_stage = "init"
-    st.session_state.uploaded_file = None
+        st.text(safe_text)
+    extracted_data = extract_entities_with_groq(safe_text)
+    st.session_state.extracted_data = extracted_data
+    st.session_state.chat_stage = "show_result"
+    st.experimental_rerun()
 
 elif st.session_state.chat_stage == "manual_entry":
     with st.chat_message("bot"):
-        st.markdown("Please enter the customer details in this format:\nName: ...\nPhone: ...\nEmail: ...\nCompany: ...")
+        st.markdown("Please enter the customer details:")
     user_input = st.chat_input("Type details here")
     if user_input:
         extracted_data = extract_entities_with_groq(user_input)
+        st.session_state.extracted_data = extracted_data
+        st.session_state.chat_stage = "show_result"
+        st.experimental_rerun()
+
+elif st.session_state.chat_stage == "show_result":
+    extracted_data = st.session_state.extracted_data
+    if extracted_data:
         with st.chat_message("bot"):
-            if extracted_data:
-                st.markdown("✅ Extracted customer details:")
-                st.json(extracted_data)
-                customers = get_all_customers()
-                is_match, matched, scores = fuzzy_match_customer(extracted_data, customers)
-                if is_match:
-                    st.info("✅ Customer already exists:")
-                    st.json(matched)
-                    st.write("**Match Scores:**")
-                    st.json(scores)
-                else:
-                    st.warning("🆕 This is a new customer.")
-                    st.json(extracted_data)
-                    if st.button("✅ Add to database"):
-                        insert_customer("customers.db", extracted_data)
-                        st.success("Customer added successfully!")
-            else:
-                st.error("❌ Could not extract structured data.")
-        st.session_state.chat_stage = "init"
+            st.markdown("✅ Extracted customer data:")
+            for key, value in extracted_data.items():
+                st.write(f"**{key.capitalize()}**: {value}")
+        customers = get_all_customers()
+        is_match, matched, scores = fuzzy_match_customer(extracted_data, customers)
+        if is_match:
+            st.info("✅ Customer already exists:")
+            for key, value in matched.items():
+                st.write(f"**{key.capitalize()}**: {value}")
+            st.write("**Match Scores:**")
+            for key, value in scores.items():
+                st.write(f"{key}: {value}")
+        else:
+            st.warning("🆕 This is a new customer.")
+            with st.form("add_customer_form"):
+                name = st.text_input("Name", value=extracted_data.get("name", ""))
+                phone = st.text_input("Phone Number", value=extracted_data.get("phone_number", ""))
+                email = st.text_input("Email Address", value=extracted_data.get("email_address", ""))
+                company = st.text_input("Company", value=extracted_data.get("company", ""))
+                if st.form_submit_button("✅ Add to database"):
+                    try:
+                        insert_customer("customers.db", {
+                            "name": name,
+                            "phone_number": phone,
+                            "email_address": email,
+                            "company": company
+                        })
+                        st.session_state.add_result = "success"
+                    except:
+                        st.session_state.add_result = "error"
+                    st.session_state.chat_stage = "waiting_for_choice"
+                    st.experimental_rerun()
+    else:
+        st.error("❌ Could not extract structured data.")
+        st.session_state.chat_stage = "waiting_for_choice"
